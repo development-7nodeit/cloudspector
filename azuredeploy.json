@@ -1,0 +1,359 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "containerGroupName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Name for the Azure Container Instance resource (1-63 chars, lowercase letters/numbers/hyphens only, cannot start or end with a hyphen — Azure Container Instance naming rule)."
+      }
+    },
+    "storageAccountName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Globally unique storage account name (3-24 chars, lowercase letters and numbers ONLY, no hyphens — Azure Storage Account naming rule). Example: csagentcontoso001"
+      }
+    },
+    "fileShareName": {
+      "type": "string",
+      "defaultValue": "cloudspector-data",
+      "minLength": 3,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Azure Files share name (3-63 chars, lowercase letters/numbers/hyphens, cannot start/end with a hyphen or use consecutive hyphens — Azure Files naming rule). The agent mounts this share at /data for persistent storage of provider packages (not the database — see sqlServerName)."
+      }
+    },
+    "agentImageName": {
+      "type": "string",
+      "defaultValue": "7nodeit.azurecr.io/cloudspector.agent:latest",
+      "metadata": {
+        "description": "Full container image reference. Change only if instructed by 7NodeIT support."
+      }
+    },
+    "acrTokenUsername": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 50,
+      "metadata": {
+        "description": "ACR repository-scoped token name provided by 7NodeIT (max 50 chars — Azure Container Registry token naming rule). This is a token name, not a password — it is not secret."
+      }
+    },
+    "acrTokenPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "ACR repository-scoped token password provided by 7NodeIT. Store this in Azure Key Vault and reference it here."
+      }
+    },
+    "authPepper": {
+      "type": "securestring",
+      "minLength": 32,
+      "metadata": {
+        "description": "REQUIRED — type your own random string of at least 32 characters (letters/numbers/symbols), store it in Azure Key Vault, and reference it here. This is used by the agent to hash user passwords (PBKDF2-SHA512). It is not provided by 7NodeIT — you generate it yourself, once. IMPORTANT: if this value is ever lost, existing agent user passwords can no longer be verified and all accounts must be recreated."
+      }
+    },
+    "cloudSpectorApiBaseUrl": {
+      "type": "string",
+      "defaultValue": "https://cloudspectorapi.redcoast-8186da07.westeurope.azurecontainerapps.io",
+      "metadata": {
+        "description": "CloudSpector backend API URL. Used by the agent when running in Online connectivity mode. Do not change unless instructed by 7NodeIT."
+      }
+    },
+    "sqlServerName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "metadata": {
+        "description": "Globally unique Azure SQL logical server name (1-63 chars, lowercase letters/numbers/hyphens, cannot start or end with a hyphen — Azure SQL server naming rule). Example: csagent-sql-contoso001"
+      }
+    },
+    "sqlServerLocation": {
+      "type": "string",
+      "defaultValue": "westeurope",
+      "allowedValues": [
+        "westeurope",
+        "northeurope",
+        "swedencentral",
+        "francecentral",
+        "germanywestcentral",
+        "uksouth",
+        "eastus",
+        "eastus2",
+        "westus2",
+        "southeastasia"
+      ],
+      "metadata": {
+        "description": "Azure region for the SQL Server + Database. Deliberately separate from the resource group's region: some subscriptions are restricted from provisioning Azure SQL in certain regions (error 'ProvisioningDisabled'). If deployment fails with that error, pick a different region here — the Storage Account and Container Instance are unaffected and keep using the resource group's own region."
+      }
+    },
+    "sqlDatabaseName": {
+      "type": "string",
+      "defaultValue": "cloudspector-agent-db",
+      "minLength": 1,
+      "maxLength": 128,
+      "metadata": {
+        "description": "Name of the Azure SQL Database that stores the agent's local data (baselines, design decisions, users, feed items, check metadata). 1-128 chars — Azure SQL database naming rule."
+      }
+    },
+    "sqlDatabaseSkuName": {
+      "type": "string",
+      "defaultValue": "Basic",
+      "allowedValues": [
+        "Basic",
+        "S0",
+        "S1"
+      ],
+      "metadata": {
+        "description": "Azure SQL Database pricing tier. Basic (~€4-5/month) is sufficient for the agent's lightweight local database; upgrade to S0/S1 only if you experience performance issues."
+      }
+    },
+    "agentInstanceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "ADR-087 — the agent's instance identity, minted by the CloudSpector customer portal when you created this agent. Pre-filled when you reach this template through the portal's Deploy step; leave empty only if you are deploying by hand and intend the agent to generate its own GUID, which you must then register manually. The agent adopts this value ONLY on first start with an empty database — an agent that already has an identity keeps it."
+      }
+    },
+    "agentEnrollmentSecret": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "ADR-089 — one-time secret the agent uses to fetch its first license, so no .lic file has to be uploaded by hand. Pre-filled by the portal's Deploy step. It is consumed the first time the agent successfully retrieves its license and is worthless afterwards; if the deployment fails before that, regenerate the deployment link from the portal. Leave empty to deploy an agent that expects its license to be uploaded manually."
+      }
+    }
+  },
+  "variables": {
+    "location": "[resourceGroup().location]",
+    "managedIdentityName": "[concat(parameters('containerGroupName'), '-identity')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[variables('managedIdentityName')]",
+      "location": "[variables('location')]",
+      "comments": "User-assigned, not system-assigned: only a user-assigned managed identity can be set as the Azure AD administrator of an Azure SQL Server. System-assigned identities are not supported for that role (see ADR-043 amendment)."
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "[parameters('storageAccountName')]",
+      "location": "[variables('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "supportsHttpsTrafficOnly": true,
+        "minimumTlsVersion": "TLS1_2",
+        "allowBlobPublicAccess": false
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/fileServices/shares",
+      "apiVersion": "2023-01-01",
+      "name": "[concat(parameters('storageAccountName'), '/default/', parameters('fileShareName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+      ],
+      "properties": {
+        "shareQuota": 32
+      }
+    },
+    {
+      "type": "Microsoft.ContainerInstance/containerGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('containerGroupName')]",
+      "location": "[variables('location')]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]": {}
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]",
+        "[resourceId('Microsoft.Storage/storageAccounts/fileServices/shares', parameters('storageAccountName'), 'default', parameters('fileShareName'))]",
+        "[resourceId('Microsoft.Sql/servers/databases', parameters('sqlServerName'), parameters('sqlDatabaseName'))]"
+      ],
+      "properties": {
+        "containers": [
+          {
+            "name": "cloudspector-agent",
+            "properties": {
+              "image": "[parameters('agentImageName')]",
+              "resources": {
+                "requests": {
+                  "cpu": 1,
+                  "memoryInGB": 1.5
+                }
+              },
+              "ports": [
+                {
+                  "port": 8080,
+                  "protocol": "TCP"
+                }
+              ],
+              "environmentVariables": [
+                {
+                  "name": "ASPNETCORE_ENVIRONMENT",
+                  "value": "Production"
+                },
+                {
+                  "name": "PersistentStorage__Path",
+                  "value": "/data"
+                },
+                {
+                  "name": "CLOUDSPECTOR_DATA_PATH",
+                  "value": "/data"
+                },
+                {
+                  "name": "Auth__Pepper",
+                  "secureValue": "[parameters('authPepper')]"
+                },
+                {
+                  "name": "CloudSpectorApi__BaseUrl",
+                  "value": "[parameters('cloudSpectorApiBaseUrl')]"
+                },
+                {
+                  "name": "Agent__InstanceId",
+                  "value": "[parameters('agentInstanceId')]"
+                },
+                {
+                  "name": "Agent__EnrollmentSecret",
+                  "secureValue": "[parameters('agentEnrollmentSecret')]"
+                },
+                {
+                  "name": "ConnectionStrings__CloudSpector",
+                  "value": "[concat('Server=tcp:', parameters('sqlServerName'), '.database.windows.net,1433;Initial Catalog=', parameters('sqlDatabaseName'), ';Authentication=Active Directory Managed Identity;User Id=', reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').clientId, ';Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;')]"
+                }
+              ],
+              "volumeMounts": [
+                {
+                  "name": "cloudspector-data",
+                  "mountPath": "/data"
+                }
+              ]
+            }
+          }
+        ],
+        "imageRegistryCredentials": [
+          {
+            "server": "7nodeit.azurecr.io",
+            "username": "[parameters('acrTokenUsername')]",
+            "password": "[parameters('acrTokenPassword')]"
+          }
+        ],
+        "osType": "Linux",
+        "restartPolicy": "Always",
+        "ipAddress": {
+          "type": "Public",
+          "ports": [
+            {
+              "port": 8080,
+              "protocol": "TCP"
+            }
+          ]
+        },
+        "volumes": [
+          {
+            "name": "cloudspector-data",
+            "azureFile": {
+              "shareName": "[parameters('fileShareName')]",
+              "storageAccountName": "[parameters('storageAccountName')]",
+              "storageAccountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2023-01-01').keys[0].value]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers",
+      "apiVersion": "2022-05-01-preview",
+      "name": "[parameters('sqlServerName')]",
+      "location": "[parameters('sqlServerLocation')]",
+      "comments": "No SQL login/password is created. Azure AD-only authentication with a user-assigned managed identity as the sole server administrator (see ADR-043 and its amendment — system-assigned identities are not supported in this role). This resource depends only on the user-assigned identity, not on the Container Group — which is what lets the Container Group depend on this server (and its database) in turn, without a circular dependency, so the agent no longer starts before the database exists.",
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]"
+      ],
+      "properties": {
+        "version": "12.0",
+        "administrators": {
+          "administratorType": "ActiveDirectory",
+          "principalType": "Application",
+          "login": "[variables('managedIdentityName')]",
+          "sid": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').principalId]",
+          "tenantId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').tenantId]",
+          "azureADOnlyAuthentication": true
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/firewallRules",
+      "apiVersion": "2021-11-01",
+      "name": "[concat(parameters('sqlServerName'), '/AllowAgentContainer')]",
+      "comments": "Scoped to the Container Group's own public IP — the precise, least-privilege rule. A broader 'AllowAzureServices' fallback rule (below) also exists for robustness (see ADR-043 amendment); this one remains the primary, tighter rule.",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]",
+        "[resourceId('Microsoft.ContainerInstance/containerGroups', parameters('containerGroupName'))]"
+      ],
+      "properties": {
+        "startIpAddress": "[reference(resourceId('Microsoft.ContainerInstance/containerGroups', parameters('containerGroupName'))).ipAddress.ip]",
+        "endIpAddress": "[reference(resourceId('Microsoft.ContainerInstance/containerGroups', parameters('containerGroupName'))).ipAddress.ip]"
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/firewallRules",
+      "apiVersion": "2021-11-01",
+      "name": "[concat(parameters('sqlServerName'), '/AllowAzureServices')]",
+      "comments": "Broad fallback rule ('Allow Azure services and resources to access this server' in the Portal UI). Deliberately reintroduced alongside the container-scoped rule above for reliability, at the cost of allowing connections from any Azure customer's resources, not just this deployment's (Microsoft's own documented trade-off for this option) — see ADR-043 amendment.",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]"
+      ],
+      "properties": {
+        "startIpAddress": "0.0.0.0",
+        "endIpAddress": "0.0.0.0"
+      }
+    },
+    {
+      "type": "Microsoft.Sql/servers/databases",
+      "apiVersion": "2021-11-01",
+      "name": "[concat(parameters('sqlServerName'), '/', parameters('sqlDatabaseName'))]",
+      "location": "[parameters('sqlServerLocation')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Sql/servers', parameters('sqlServerName'))]"
+      ],
+      "sku": {
+        "name": "[parameters('sqlDatabaseSkuName')]"
+      },
+      "properties": {
+        "collation": "SQL_Latin1_General_CP1_CI_AS"
+      }
+    }
+  ],
+  "outputs": {
+    "containerPublicIp": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ContainerInstance/containerGroups', parameters('containerGroupName'))).ipAddress.ip]"
+    },
+    "agentUrl": {
+      "type": "string",
+      "value": "[concat('http://', reference(resourceId('Microsoft.ContainerInstance/containerGroups', parameters('containerGroupName'))).ipAddress.ip, ':8080')]"
+    },
+    "sqlServerFqdn": {
+      "type": "string",
+      "value": "[concat(parameters('sqlServerName'), '.database.windows.net')]"
+    },
+    "sqlDatabaseName": {
+      "type": "string",
+      "value": "[parameters('sqlDatabaseName')]"
+    },
+    "managedIdentityClientId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').clientId]"
+    }
+  }
+}
